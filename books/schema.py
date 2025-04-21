@@ -1,41 +1,81 @@
 import graphene
-from graphene_django import DjangoObjectType
-from .models import Book
 from django.db.models import Q
-from graphql_jwt.decorators import login_required
+from graphene_django import DjangoObjectType
 from graphql import GraphQLError
+from graphql_jwt.decorators import login_required
+
+from .models import Book
+
 
 class BookType(DjangoObjectType):
     class Meta:
         model = Book
 
 class Query(graphene.ObjectType):
-    books = graphene.List(BookType, 
-    search=graphene.String(), first = graphene.Int(), skip=graphene.Int())
-    book = graphene.Field(BookType, id=graphene.Int(required=True))
-    my_books = graphene.List(BookType)
+    books = graphene.List(
+        BookType,
+        search=graphene.String(),
+        first=graphene.Int(),
+        skip=graphene.Int(),
+        description="Get a list of all books, optionally filtered by search term"
+    )
+    book = graphene.Field(
+        BookType,
+        id=graphene.Int(required=True),
+        description="Get a single book by ID"
+    )
+    my_books = graphene.List(
+        BookType,
+        description="Get all books belonging to the authenticated user"
+    )
 
     def resolve_books(self, info, search=None, first=None, skip=None):
-        books = Book.objects.all()
-        if search:
-            filter = Q(title__icontains=search) 
-            books = books.filter(filter)
-        if skip:
-            books = books[skip:]
-        if first:
-            books = books[:first]
-        return books
-
-    def resolve_book(self,info,id):
         try:
-            book = Book.objects.get(id=id)
+            # Use select_related to optimize queries
+            books = Book.objects.select_related('author').all()
+            
+            if search:
+                filter = (
+                    Q(title__icontains=search) |
+                    Q(description__icontains=search)
+                )
+                books = books.filter(filter)
+            
+            if skip and skip < 0:
+                raise ValueError("Skip value cannot be negative")
+                
+            if first and first < 0:
+                raise ValueError("First value cannot be negative")
+                
+            if skip:
+                books = books[skip:]
+            if first:
+                books = books[:first]
+                
+            return books
+            
+        except Exception as e:
+            raise GraphQLError(str(e))
+
+    def resolve_book(self, info, id):
+        try:
+            return Book.objects.select_related('author').get(id=id)
         except Book.DoesNotExist:
             raise GraphQLError("Book with this id doesn't exist")
-        return book
+        except Exception as e:
+            raise GraphQLError(str(e))
 
     @login_required
-    def resolve_my_books(self,info):
-        return Book.objects.all().filter(author=info.context.user)
+    def resolve_my_books(self, info):
+        try:
+            return (
+                Book.objects
+                .select_related('author')
+                .filter(author=info.context.user)
+                .order_by('-id')  # Latest first
+            )
+        except Exception as e:
+            raise GraphQLError(str(e))
 
 class CreateBookInput(graphene.InputObjectType):
         title = graphene.String(required=True)
@@ -43,21 +83,36 @@ class CreateBookInput(graphene.InputObjectType):
         year_published = graphene.Int(required=True)
 
 class CreateBook(graphene.Mutation):
-    book = graphene.Field(BookType)
-
     class Arguments:
         create_book_input = CreateBookInput(required=True)
 
+    book = graphene.Field(BookType)
+    success = graphene.Boolean()
+    errors = graphene.List(graphene.String)
+
     @login_required
     def mutate(self, info, create_book_input):
-            book = Book()
-            book.title = create_book_input.title
-            book.description = create_book_input.description
-            book.year_published = create_book_input.year_published
-            book.author = info.context.user
+        try:
+            if create_book_input.year_published < 0:
+                return CreateBook(
+                    success=False,
+                    errors=["Year published cannot be negative"]
+                )
+                
+            book = Book(
+                title=create_book_input.title,
+                description=create_book_input.description,
+                year_published=create_book_input.year_published,
+                author=info.context.user
+            )
             book.save()
+            
+            return CreateBook(book=book, success=True)
+            
+        except Exception as e:
             return CreateBook(
-                book=book
+                success=False,
+                errors=[str(e)]
             )
 
 class UpdateBookInput(graphene.InputObjectType):
@@ -67,47 +122,84 @@ class UpdateBookInput(graphene.InputObjectType):
     year_published = graphene.Int()
 
 class UpdateBook(graphene.Mutation):
-    book = graphene.Field(BookType)
-    
     class Arguments:
         update_book_input = UpdateBookInput(required=True)
 
+    book = graphene.Field(BookType)
+    success = graphene.Boolean()
+    errors = graphene.List(graphene.String)
+
     @login_required
-    def mutate(self,info,update_book_input):
+    def mutate(self, info, update_book_input):
         try:
             book = Book.objects.get(id=update_book_input.id)
+            
+            if book.author.id != info.context.user.id:
+                return UpdateBook(
+                    success=False, 
+                    errors=["You cannot update a book which is not yours"]
+                )
+
+            if update_book_input.title is not None:
+                book.title = update_book_input.title
+            if update_book_input.description is not None:
+                book.description = update_book_input.description
+            if update_book_input.year_published is not None:
+                if update_book_input.year_published < 0:
+                    return UpdateBook(
+                        success=False,
+                        errors=["Year published cannot be negative"]
+                    )
+                book.year_published = update_book_input.year_published
+            
+            book.save()
+            return UpdateBook(book=book, success=True)
+            
         except Book.DoesNotExist:
-            raise GraphQLError("Book with this id doesn't exist")
-        if book.author.id is not info.context.user.id:
-            raise GraphQLError("You cannot update a book which is not yours")
-        if update_book_input.title is not None:
-            book.title = update_book_input.title
-        if update_book_input.description is not None:
-            book.description = update_book_input.description
-        if update_book_input.year_published is not None:
-            book.year_published = update_book_input.year_published
-        book.save()
-        return UpdateBook(book=book)
+            return UpdateBook(
+                success=False,
+                errors=["Book with this id doesn't exist"]
+            )
+        except Exception as e:
+            return UpdateBook(
+                success=False,
+                errors=[str(e)]
+            )
 
 class DeleteBook(graphene.Mutation):
-    success= graphene.Boolean()
-
     class Arguments:
         book_id = graphene.Int(required=True)
 
-    def mutate(self,info,book_id):
+    success = graphene.Boolean()
+    errors = graphene.List(graphene.String)
+
+    @login_required
+    def mutate(self, info, book_id):
         try:
             book = Book.objects.get(id=book_id)
+            
+            if book.author.id != info.context.user.id:
+                return DeleteBook(
+                    success=False,
+                    errors=["You cannot delete a book which is not yours"]
+                )
+                
+            book.delete()
+            return DeleteBook(success=True)
+            
         except Book.DoesNotExist:
-            raise GraphQLError("Book with this id doesn't exist")
-        if book.author.id is not info.context.user.id:
-            raise GraphQLError("You cannot delete a book which is not yours")
-        book.delete()
-        return DeleteBook(success=True)
-
+            return DeleteBook(
+                success=False,
+                errors=["Book with this id doesn't exist"]
+            )
+        except Exception as e:
+            return DeleteBook(
+                success=False,
+                errors=[str(e)]
+            )
 
 class Mutation(graphene.ObjectType):
     create_book = CreateBook.Field()
     update_book = UpdateBook.Field()
     delete_book = DeleteBook.Field()
-    
+
